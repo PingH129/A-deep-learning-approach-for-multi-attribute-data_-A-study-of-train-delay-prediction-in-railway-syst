@@ -1,0 +1,197 @@
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import MinMaxScaler,StandardScaler
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Conv3D,MaxPooling3D,LSTM,Dropout,Input,concatenate,Dense,PReLU,Flatten
+from tensorflow.keras.callbacks import EarlyStopping,ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.optimizers import RMSprop,Adam
+import time
+np.random.seed(2019)
+
+batch_size=105   #daily average trains
+
+n_trains=3 #number of train in each picture
+n_states=4  # number of train states in each picture 
+time_step=4  #number of pictures in each cubic
+
+n_cz=5   # number of station/section the data from
+
+
+df1 = pd.read_csv('Ut-Eind.csv')
+data=np.array(df1.iloc[:,2:])
+train_day=np.int(0.75*data.shape[0]/batch_size)
+test_day=np.int(data.shape[0]/batch_size)-train_day
+print(train_day)
+print(test_day)
+
+
+data_convlstm1=data[:,9*n_cz:]   #spatiotemporal features for 3D CNN
+
+def transf_data_timespace1(l2,l3,training_size):
+    datax=data_convlstm1[:,:-1]
+    result = []
+    for i in np.arange(datax.shape[0]-l2):
+        result1=[]
+        for j in np.arange(time_step):
+            result1.append(datax[i:(i+l2),2*j:(2*j+l3)])
+        result.append(result1)
+    print('result len:',len(result))
+    print('result shape:',np.array(result).shape)
+    # print(result[:3])
+    result = np.array(result)
+    index = [i for i in range(len(result))]
+    np.random.seed(2019) 
+    np.random.shuffle(index)
+    print(index[:3])
+    result = result[index]
+    result=result.reshape(result.shape[0],result.shape[1],result.shape[2],result.shape[3],1)
+    # split train、test
+    y_data= data_convlstm1[l2-1:, -1]
+    y_data=y_data[index]
+    x_train = result[:training_size]
+    y_train = y_data[:training_size]
+    x_test = result[training_size:training_size+batch_size*test_day]
+    y_test = y_data[training_size:training_size+batch_size*test_day]
+    print('X_train shape:',x_train.shape)
+    print('y_train shape:',y_train.shape)
+    print('X_test shape:',x_test.shape)
+    print('y_test shape:',y_test.shape)
+    return [x_train, y_train, x_test, y_test,index]
+X1_train, Y1_train, X1_test, Y1_test,index=transf_data_timespace1(n_trains,n_states,train_day*batch_size)
+#print(X1_train[:5])
+#print(Y1_train[:5])
+#print('index',index[:3])
+
+
+data_lstm=data[:,2*n_cz:9*n_cz]   #temporal features for LSTM
+
+def load_data(l2,train_size):
+    datax=data_lstm
+    scaler=MinMaxScaler(feature_range=(0,1))
+    scaler.fit(datax)
+    datax=scaler.transform(datax)
+    result = []
+    for i in np.arange(datax.shape[0]-l2):
+        result.append(datax[i:i+l2,:])
+    
+    print('result len:',len(result))
+    print('result shape:',np.array(result).shape)
+    result = np.array(result)
+    index = [i for i in range(len(result))]
+    np.random.seed(2019)
+    np.random.shuffle(index)
+    print(index[:3])
+    result = result[index]
+    result = result.reshape(result.shape[0],l2*7,5)
+    # split train、test
+    x_train = result[:train_size]
+    x_test = result[train_size:train_size+batch_size*test_day]
+    print('X_train shape:',x_train.shape)
+
+    print('X_test shape:',x_test.shape)
+    return [x_train, x_test]
+X2_train,  X2_test=load_data(n_trains,train_day*batch_size)
+
+
+data_dense=data[:,:2*n_cz]   #static features for FCNN
+def load_data(l2,train_size):
+    datax = data_dense
+    scaler=MinMaxScaler(feature_range=(0,1))
+    scaler.fit(datax)
+    datax=scaler.transform(datax)
+    result = []
+    for i in np.arange(datax.shape[0] - l2):
+        result.append(datax[i:i+l2,:])
+    result = np.array(result)
+    result=result.reshape(result.shape[0],l2*10)
+    index = [i for i in range(len(result))]
+    np.random.seed(2019)
+    np.random.shuffle(index)
+    print(index[:3])
+    result = result[index]
+    x_train = result[:train_size]
+    x_test = result[train_size:train_size + batch_size * test_day]
+    print('x_train shape:',x_train.shape)
+    print('x_test shape:', x_test.shape)
+    return [x_train,x_test]
+X3_train, X3_test = load_data(n_trains,train_day * batch_size)
+
+
+#-------------3D CNN
+clstm_input_1=Input(shape=(time_step,n_trains,n_states,1))  
+
+clstm_out_1=Conv3D(filters=32,kernel_size=(2,2,2),strides=1,padding='same')(clstm_input_1)
+clstm_out_1=PReLU(alpha_initializer='ones')(clstm_out_1)
+clstm_out_1=MaxPooling3D(pool_size=2,padding='same',strides=2)(clstm_out_1)
+
+clstm_out_1=Conv3D(filters=64,kernel_size=(2,2,2),strides=1,padding='same')(clstm_out_1)
+clstm_out_1=PReLU(alpha_initializer='ones')(clstm_out_1)
+clstm_out_1=MaxPooling3D(pool_size=2,padding='same',strides=2)(clstm_out_1)
+
+clstm_out_1=Flatten()(clstm_out_1)
+
+
+#--------------lstm
+lstm_input = Input(shape=(X2_train.shape[1], X2_train.shape[2]))
+lstm_out=LSTM(64,return_sequences=True)(lstm_input)
+
+lstm_out=LSTM(64)(lstm_out)
+
+
+#-------------dense
+dense_input=Input(shape=(X3_train.shape[1],))
+dense_out=Dense(32)(dense_input)
+dense_out=PReLU(alpha_initializer='ones')(dense_out)
+dense_out=Dense(32)(dense_out)
+dense_out=PReLU(alpha_initializer='ones')(dense_out)
+dense_out=Dense(32)(dense_out)
+dense_out=PReLU(alpha_initializer='ones')(dense_out)
+
+y = concatenate([clstm_out_1,lstm_out,dense_out],axis=-1)  # merging 
+y=Dense(64,activation='relu')(y)
+y=Dense(1)(y)   #output 
+
+
+model = Model(inputs=[clstm_input_1,lstm_input,dense_input],
+              outputs=y)  # define the model
+
+model.summary()   # show the model
+
+
+optimizer=Adam()
+model.compile(optimizer=optimizer, loss='mse')
+
+# early_stopping = EarlyStopping(monitor='val_loss', patience=5)
+reducelr=ReduceLROnPlateau(monitor='val_loss',factor=0.5,patience=5)
+
+filepath="weights1.hdf5"
+model_checkpoint_callback = ModelCheckpoint(filepath, 
+                                            monitor='val_loss', 
+                                            verbose=1, 
+                                            save_best_only=True, 
+                                            mode='auto')
+
+starttime=time.time()
+hist=model.fit([X1_train,X2_train,X3_train],
+               Y1_train,epochs=60, 
+               batch_size=batch_size,
+               validation_split=0.2,
+               callbacks=[model_checkpoint_callback,reducelr])
+
+print("training time:",time.time()-starttime)
+history=pd.DataFrame(hist.history)
+history.to_csv('0history.csv')
+
+model.save('my_model.h5')
+
+#model = load_model('my_model.h5')
+model.load_weights(filepath)
+# #--------------------prediction-----------------------
+
+prediction=model.predict([X1_test,X2_test,X3_test])
+prediction=prediction.reshape(prediction.shape[0],1)
+Y_test=Y1_test.reshape(Y1_test.shape[0],1)
+Y_test=np.concatenate([Y_test,prediction],axis=1)
+test_df=pd.DataFrame(Y_test,columns=['Y','prediction'])
+test_df.to_csv('00_test_df.csv')
